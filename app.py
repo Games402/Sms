@@ -11,14 +11,18 @@ app = Flask(__name__)
 
 # Avoid running multiple instances at once
 is_running = False
+from selenium.webdriver.chrome.service import Service
 
 def setup_browser():
     chrome_options = Options()
     chrome_options.add_argument("--headless")
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-dev-shm-usage")
-    chrome_options.binary_location = "/usr/bin/chromium"  # For Render
-    return webdriver.Chrome(executable_path="/usr/bin/chromedriver", options=chrome_options)
+    chrome_options.binary_location = "/usr/bin/chromium"  # Optional, only if needed
+
+    service = Service("/usr/bin/chromedriver")
+    return webdriver.Chrome(service=service, options=chrome_options)
+    
 
 def automate_browser(number):
     global is_running
