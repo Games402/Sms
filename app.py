@@ -10,76 +10,71 @@ app = Flask(__name__)
 
 def setup_browser():
     chrome_options = Options()
-    chrome_options.add_argument("--headless")
-    chrome_options.add_argument("--no-sandbox")
-    chrome_options.add_argument("--disable-dev-shm-usage")
-    chrome_options.binary_location = "/usr/bin/chromium"
+    chrome_options.add_argument('--headless')
+    chrome_options.add_argument('--no-sandbox')
+    chrome_options.add_argument('--disable-dev-shm-usage')
+    chrome_options.binary_location = "/usr/bin/chromium"  # Required for Render
     return webdriver.Chrome(executable_path="/usr/bin/chromedriver", options=chrome_options)
 
 @app.route('/start')
-def start_automation():
-    phone_number = request.args.get('number')
-    if not phone_number:
-        return jsonify({"error": "Missing phone number"}), 400
-
-    url = "https://www.thecallbomber.in/"  # Replace this with the actual site
+def automate():
+    number = request.args.get('number')
+    if not number:
+        return jsonify({"error": "Missing number parameter"}), 400
 
     browser = setup_browser()
     wait = WebDriverWait(browser, 20)
 
     try:
-        browser.get(url)
-        print("🌐 Website opened.")
+        browser.get("https://www.thecallbomber.in/")  # Replace with actual target site
+        print("🔗 Opened website")
 
-        # Step 1: Enter number
-        number_box = wait.until(EC.presence_of_element_located((By.ID, "mobileNumber")))
-        number_box.send_keys(phone_number)
-        print("📱 Phone number entered.")
+        # Only one input field (phone number)
+        input_box = wait.until(EC.presence_of_element_located((By.TAG_NAME, "input")))
+        input_box.send_keys(number)
+        print("📱 Entered phone number")
 
-        # Step 2: Click checkbox
+        # Checkbox
         checkbox = wait.until(EC.element_to_be_clickable((By.ID, "terms")))
         checkbox.click()
-        print("✅ Checkbox clicked.")
+        print("✅ Checkbox clicked")
 
-        # Step 3: Wait 40s
-        print("⏳ Waiting 40 seconds...")
+        print("⏳ Waiting 40 seconds before scroll...")
         time.sleep(40)
 
-        # Step 4: Scroll simulation
+        # Scroll actions
         browser.execute_script("window.scrollBy(0, 1000);")
         time.sleep(10)
-        browser.execute_script("window.scrollBy(0, -200);")
+        browser.execute_script("window.scrollBy(0, -500);")
         time.sleep(20)
-        browser.execute_script("window.scrollBy(0, 300);")
+        browser.execute_script("window.scrollBy(0, 100);")
         time.sleep(10)
-        print("🖱️ Scrolling done.")
+        print("🖱️ Scrolled")
 
-        # Step 5: Click submit
-        submit_btn = wait.until(EC.element_to_be_clickable((By.ID, "submit")))
-        submit_btn.click()
-        print("🚀 Submit clicked.")
+        # Click Submit
+        submit = wait.until(EC.element_to_be_clickable((By.ID, "submit")))
+        submit.click()
+        print("🚀 Submit clicked")
 
-        # Step 6: Wait 45s on next page
-        print("⏳ Waiting 45 seconds for verify button...")
+        # Wait for 45s on next page
         time.sleep(45)
 
-        verify_btn = wait.until(EC.element_to_be_clickable((By.ID, "verify_button")))
-        verify_btn.click()
-        print("✅ Verify button clicked.")
+        verify_button = wait.until(EC.element_to_be_clickable((By.ID, "verify_button")))
+        verify_button.click()
+        print("✅ Verify button clicked")
 
-        # Step 7: Final 90s wait
-        print("⏳ Waiting final 90 seconds...")
+        # Wait 90s for final page
         time.sleep(90)
+        print("🎉 Finished automation")
 
-        print("🎉 Automation completed successfully.")
         return jsonify({"status": "success", "message": "Automation complete!"})
 
     except Exception as e:
-        print("❌ Error:", e)
-        return jsonify({"status": "error", "message": str(e)})
+        print("❌ Error:", str(e))
+        return jsonify({"status": "error", "message": str(e)}), 500
 
     finally:
         browser.quit()
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     app.run(host="0.0.0.0", port=5000)
