@@ -4,7 +4,6 @@ from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 import threading
 import time
-import os
 
 app = Flask(__name__)
 is_running = False
@@ -13,27 +12,23 @@ def run_browser(number):
     global is_running
     is_running = True
 
-    # Setup super light browser
+    # Setup lightweight browser options
     options = Options()
     options.add_argument("--headless=new")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
 
-    # Use Chrome if available, fallback if not
-    options.binary_location = "/usr/bin/google-chrome" if os.path.exists("/usr/bin/google-chrome") else None
-
     try:
         driver = webdriver.Chrome(options=options)
-        driver.get("https://www.thecallbomber.in")  # Replace with real URL
+        driver.get("https://www.thecallbomber.in")  # Replace with actual site
 
-        # Find the only textbox
+        # Interact with first page
         input_box = driver.find_element(By.TAG_NAME, "input")
         input_box.send_keys(number)
 
-        # Checkbox
         driver.find_element(By.ID, "terms").click()
-
         time.sleep(40)
+
         driver.execute_script("window.scrollBy(0, 1000);")
         time.sleep(10)
         driver.execute_script("window.scrollBy(0, -500);")
@@ -41,12 +36,10 @@ def run_browser(number):
         driver.execute_script("window.scrollBy(0, 100);")
         time.sleep(10)
 
-        # Submit button
         driver.find_element(By.ID, "submit").click()
-
         time.sleep(45)
-        driver.find_element(By.ID, "verify_button").click()
 
+        driver.find_element(By.ID, "verify_button").click()
         time.sleep(90)
 
     except Exception as e:
