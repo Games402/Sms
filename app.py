@@ -22,7 +22,7 @@ def start_automation():
     if not phone_number:
         return jsonify({"error": "Missing phone number"}), 400
 
-    url = "https://your-target-website.com"  # Replace this with the actual site
+    url = "https://www.thecallbomber.in/"  # Replace this with the actual site
 
     browser = setup_browser()
     wait = WebDriverWait(browser, 20)
