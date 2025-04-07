@@ -5,76 +5,78 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 import time
+import threading
 
 app = Flask(__name__)
 
+# Avoid running multiple instances at once
+is_running = False
+
 def setup_browser():
     chrome_options = Options()
-    chrome_options.add_argument('--headless')
-    chrome_options.add_argument('--no-sandbox')
-    chrome_options.add_argument('--disable-dev-shm-usage')
-    chrome_options.binary_location = "/usr/bin/chromium"  # Required for Render
+    chrome_options.add_argument("--headless")
+    chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-dev-shm-usage")
+    chrome_options.binary_location = "/usr/bin/chromium"  # For Render
     return webdriver.Chrome(executable_path="/usr/bin/chromedriver", options=chrome_options)
 
-@app.route('/start')
-def automate():
-    number = request.args.get('number')
-    if not number:
-        return jsonify({"error": "Missing number parameter"}), 400
-
+def automate_browser(number):
+    global is_running
+    is_running = True
     browser = setup_browser()
     wait = WebDriverWait(browser, 20)
 
     try:
-        browser.get("https://www.thecallbomber.in/")  # Replace with actual target site
-        print("🔗 Opened website")
+        browser.get("https://example.com")  # Replace with your real site
+        print("🌐 Opened site")
 
-        # Only one input field (phone number)
         input_box = wait.until(EC.presence_of_element_located((By.TAG_NAME, "input")))
         input_box.send_keys(number)
-        print("📱 Entered phone number")
+        print("📱 Number entered")
 
-        # Checkbox
         checkbox = wait.until(EC.element_to_be_clickable((By.ID, "terms")))
         checkbox.click()
-        print("✅ Checkbox clicked")
 
-        print("⏳ Waiting 40 seconds before scroll...")
         time.sleep(40)
-
-        # Scroll actions
         browser.execute_script("window.scrollBy(0, 1000);")
         time.sleep(10)
         browser.execute_script("window.scrollBy(0, -500);")
         time.sleep(20)
         browser.execute_script("window.scrollBy(0, 100);")
         time.sleep(10)
-        print("🖱️ Scrolled")
 
-        # Click Submit
-        submit = wait.until(EC.element_to_be_clickable((By.ID, "submit")))
-        submit.click()
-        print("🚀 Submit clicked")
+        submit_btn = wait.until(EC.element_to_be_clickable((By.ID, "submit")))
+        submit_btn.click()
 
-        # Wait for 45s on next page
         time.sleep(45)
 
-        verify_button = wait.until(EC.element_to_be_clickable((By.ID, "verify_button")))
-        verify_button.click()
-        print("✅ Verify button clicked")
+        verify_btn = wait.until(EC.element_to_be_clickable((By.ID, "verify_button")))
+        verify_btn.click()
 
-        # Wait 90s for final page
         time.sleep(90)
-        print("🎉 Finished automation")
-
-        return jsonify({"status": "success", "message": "Automation complete!"})
+        print("✅ Automation completed")
 
     except Exception as e:
-        print("❌ Error:", str(e))
-        return jsonify({"status": "error", "message": str(e)}), 500
+        print("❌ Error during automation:", str(e))
 
     finally:
         browser.quit()
+        is_running = False
 
-if __name__ == '__main__':
+@app.route('/start')
+def start():
+    global is_running
+    number = request.args.get("number")
+    if not number:
+        return jsonify({"error": "Missing phone number"}), 400
+
+    if is_running:
+        return jsonify({"status": "busy", "message": "Machine is already running"}), 429
+
+    thread = threading.Thread(target=automate_browser, args=(number,))
+    thread.start()
+
+    return jsonify({"status": "started", "number": number})
+
+if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
