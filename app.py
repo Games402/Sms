@@ -27,7 +27,7 @@ def automate_browser(number):
     wait = WebDriverWait(browser, 20)
 
     try:
-        browser.get("https://example.com")  # Replace with your real site
+        browser.get("https://www.thecallbomber.in/")  # Replace with your real site
         print("🌐 Opened site")
 
         input_box = wait.until(EC.presence_of_element_located((By.TAG_NAME, "input")))
