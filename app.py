@@ -11,17 +11,20 @@ app = Flask(__name__)
 
 # Avoid running multiple instances at once
 is_running = False
+
+    import chromedriver_autoinstaller
 from selenium.webdriver.chrome.service import Service
 
 def setup_browser():
+    # Automatically install matching ChromeDriver
+    chromedriver_autoinstaller.install()
+
     chrome_options = Options()
     chrome_options.add_argument("--headless")
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-dev-shm-usage")
-    chrome_options.binary_location = "/usr/bin/chromium"  # Optional, only if needed
 
-    service = Service("/usr/bin/chromedriver")
-    return webdriver.Chrome(service=service, options=chrome_options)
+    return webdriver.Chrome(options=chrome_options)
     
 
 def automate_browser(number):
