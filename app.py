@@ -2,60 +2,59 @@ from flask import Flask, request, jsonify
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
-from concurrent.futures import ThreadPoolExecutor
 import threading
 import time
-import psutil
-from collections import OrderedDict
-from flask_cors import CORS
+from queue import Queue
 
 app = Flask(__name__)
-CORS(app)  # Enable CORS for frontend
 
-# Config
-MAX_CACHE = 1000
-COOLDOWN_TIME = 85  # seconds
-CPU_LIMIT = 75.0
-MEM_LIMIT_MB = 400
-MAX_SESSIONS = 2
-
-# State
+is_running = False
+current_number = None
+pending_queue = Queue()
+latest_result = {}
+result_timestamps = {}
 lock = threading.Lock()
-executor = ThreadPoolExecutor(max_workers=MAX_SESSIONS)
-active_sessions = 0
-pending_queue = []
-in_progress = {}  # number: (start_time, duration)
-results = OrderedDict()  # number: final_url
 
-def system_ok():
-    cpu = psutil.cpu_percent(interval=1)
-    mem = psutil.virtual_memory().available / (1024 * 1024)
-    return cpu < CPU_LIMIT and mem > MEM_LIMIT_MB
+LAST_PAGE_URL = None
+MAX_RESULTS = 60
+MAX_PENDING_TIME = 600  # 10 minutes
 
-def cleanup_cache():
-    while len(results) > MAX_CACHE:
-        results.popitem(last=False)
+
+def cleanup_old_results():
+    current_time = time.time()
+    expired = [num for num, ts in result_timestamps.items() if current_time - ts > MAX_PENDING_TIME]
+    for num in expired:
+        latest_result.pop(num, None)
+        result_timestamps.pop(num, None)
+
+    # Limit results to MAX_RESULTS
+    if len(latest_result) > MAX_RESULTS:
+        sorted_nums = sorted(result_timestamps, key=result_timestamps.get)
+        for num in sorted_nums[:-MAX_RESULTS]:
+            latest_result.pop(num, None)
+            result_timestamps.pop(num, None)
+
 
 def run_browser(number):
-    global active_sessions
+    global is_running, current_number, LAST_PAGE_URL
     with lock:
-        active_sessions += 1
-        in_progress[number] = (time.time(), COOLDOWN_TIME)
+        is_running = True
+        current_number = number
+
+    options = Options()
+    options.add_argument("--headless=new")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
 
     try:
-        options = Options()
-        options.add_argument('--headless=new')
-        options.add_argument('--no-sandbox')
-        options.add_argument('--disable-dev-shm-usage')
         driver = webdriver.Chrome(options=options)
-
         driver.get("https://www.thecallbomber.in")
 
         input_box = driver.find_element(By.TAG_NAME, "input")
         input_box.send_keys(number)
 
         driver.find_element(By.ID, "terms").click()
-        time.sleep(35)
+        time.sleep(20)
 
         driver.execute_script("window.scrollBy(0, 1000);")
         time.sleep(3)
@@ -65,74 +64,110 @@ def run_browser(number):
         time.sleep(3)
 
         driver.find_element(By.ID, "submit").click()
-        time.sleep(35)
+        time.sleep(45)
 
         driver.find_element(By.ID, "verify_button").click()
-        time.sleep(5)
 
-        final_url = driver.current_url
-        with lock:
-            results[number] = final_url
-            cleanup_cache()
+        LAST_PAGE_URL = driver.current_url
+        latest_result[number] = LAST_PAGE_URL
+        result_timestamps[number] = time.time()
+        cleanup_old_results()
 
     except Exception as e:
         print(f"❌ Error: {e}")
     finally:
         driver.quit()
+        time.sleep(5)  # cooldown
         with lock:
-            active_sessions -= 1
-            in_progress.pop(number, None)
-        check_pending()
+            is_running = False
+            current_number = None
+        process_pending()
 
-def check_pending():
-    with lock:
-        if pending_queue and active_sessions < MAX_SESSIONS and system_ok():
-            next_number = pending_queue.pop(0)
-            executor.submit(run_browser, next_number)
+
+def process_pending():
+    global is_running
+    if not pending_queue.empty():
+        next_number, timestamp = pending_queue.get()
+        if time.time() - timestamp <= MAX_PENDING_TIME:
+            threading.Thread(target=run_browser, args=(next_number,)).start()
+        else:
+            process_pending()  # Skip expired and check next
+
 
 @app.route("/start")
 def start():
+    global is_running, current_number
     number = request.args.get("number")
+
     if not number:
-        return jsonify({"error": "Missing number"}), 400
+        return jsonify({"error": "number is required"}), 400
 
     with lock:
-        if number in in_progress:
-            start_time, total_time = in_progress[number]
-            remaining = max(0, int(start_time + total_time - time.time()))
-            return jsonify({"status": "Already running", "remaining": remaining}), 202
+        if number in latest_result:
+            return jsonify({"status": "Already completed", "url": latest_result[number]})
 
-        if number in results:
-            return jsonify({"status": "Completed", "url": results[number]}), 200
+        if is_running:
+            if number == current_number:
+                return jsonify({"status": "Processing"})
+            if number not in [n for n, _ in list(pending_queue.queue)]:
+                pending_queue.put((number, time.time()))
+            return jsonify({"status": "Machine busy, added to queue"})
 
-        if active_sessions >= MAX_SESSIONS or not system_ok():
-            if number not in pending_queue:
-                pending_queue.append(number)
-            return jsonify({"status": "Queued"}), 202
+        threading.Thread(target=run_browser, args=(number,)).start()
+        return jsonify({"status": "Started", "number": number})
 
-        executor.submit(run_browser, number)
-        return jsonify({"status": "Started", "number": number}), 200
 
 @app.route("/status")
 def status():
-    cpu = psutil.cpu_percent(interval=1)
-    mem = round(psutil.virtual_memory().available / (1024 * 1024), 2)
     with lock:
-        active = active_sessions
-        pending = len(pending_queue)
-        timers = {}
-        now = time.time()
-        for number, (start_time, total_time) in in_progress.items():
-            remaining = max(0, int(start_time + total_time - now))
-            timers[number] = remaining
+        return jsonify({
+            "is_running": is_running,
+            "current_number": current_number,
+            "pending_count": pending_queue.qsize(),
+            "last_result_url": LAST_PAGE_URL,
+            "results_stored": len(latest_result)
+        })
 
-    return jsonify({
-        "cpu_percent": cpu,
-        "available_memory_mb": mem,
-        "active_sessions": active,
-        "pending_queue_length": pending,
-        "in_progress": timers
-    })
 
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)
+@app.route("/results")
+def results():
+    number = request.args.get("number")
+    if not number:
+        return jsonify({"error": "number is required"}), 400
+    with lock:
+        if number in latest_result:
+            return jsonify({"status": "done", "url": latest_result[number]})
+        else:
+            return jsonify({"status": "not found"})
+
+
+@app.route("/cancel")
+def cancel():
+    number = request.args.get("number")
+    if not number:
+        return jsonify({"error": "number is required"}), 400
+
+    with lock:
+        q_list = list(pending_queue.queue)
+        new_queue = Queue()
+        removed = False
+        for n, t in q_list:
+            if n != number:
+                new_queue.put((n, t))
+            else:
+                removed = True
+        pending_queue.queue.clear()
+        while not new_queue.empty():
+            pending_queue.put(new_queue.get())
+        return jsonify({"status": f"{number} removed" if removed else f"{number} not in queue"})
+
+
+@app.route("/clear")
+def clear():
+    with lock:
+        pending_queue.queue.clear()
+        return jsonify({"status": "All pending numbers cleared"})
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000)
