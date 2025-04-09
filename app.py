@@ -4,45 +4,35 @@ from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 import threading
 import time
-from queue import Queue
 import json
-from datetime import datetime, timedelta
 import os
+from queue import Queue
 
 app = Flask(__name__)
 
-DATA_FILE = "completed_data.json"
-completed_data = {}
-
-def load_data():
-    global completed_data
-    if os.path.exists(DATA_FILE):
-        with open(DATA_FILE, "r") as f:
-            try:
-                completed_data = json.load(f)
-            except json.JSONDecodeError:
-                completed_data = {}
-
-def save_data():
-    try:
-        with open(DATA_FILE, "w") as f:
-            json.dump(completed_data, f)
-        print("[✅] Data saved to file")
-    except Exception as e:
-        print(f"[❌ Save failed] {e}")
-
-load_data()
-
+DATA_FILE = "results.json"
+PENDING_LIMIT = 2
 is_running = False
 current_number = None
 pending_queue = Queue()
 lock = threading.Lock()
 
-PENDING_LIMIT = 2
-RESULT_EXPIRY = timedelta(minutes=20)
+# Load existing data
+def load_results():
+    if os.path.exists(DATA_FILE):
+        with open(DATA_FILE, "r") as f:
+            return json.load(f)
+    return {}
+
+# Save results to file
+def save_results(data):
+    with open(DATA_FILE, "w") as f:
+        json.dump(data, f)
+
+results_data = load_results()
 
 def run_browser(number):
-    global is_running, current_number
+    global is_running, current_number, results_data
     with lock:
         is_running = True
         current_number = number
@@ -52,39 +42,41 @@ def run_browser(number):
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
 
-    final_url = None
     try:
         driver = webdriver.Chrome(options=options)
         driver.get("https://www.thecallbomber.in")
 
         driver.find_element(By.TAG_NAME, "input").send_keys(number)
         driver.find_element(By.ID, "terms").click()
-        time.sleep(2)
+
+        time.sleep(10)
         driver.execute_script("window.scrollBy(0, 1000);")
-        time.sleep(1)
-        driver.execute_script("window.scrollBy(0, -500);")
-        time.sleep(1)
-        driver.execute_script("window.scrollBy(0, 100);")
-        time.sleep(1)
-        driver.find_element(By.ID, "submit").click()
         time.sleep(2)
+        driver.execute_script("window.scrollBy(0, -500);")
+        time.sleep(2)
+        driver.execute_script("window.scrollBy(0, 100);")
+        time.sleep(2)
+
+        driver.find_element(By.ID, "submit").click()
+        time.sleep(5)
         driver.find_element(By.ID, "verify_button").click()
+        time.sleep(2)
 
         final_url = driver.current_url
-        print(f"[✔️] Final URL captured: {final_url}")
+
+        # Store URL externally
+        with lock:
+            results_data[number] = final_url
+            save_results(results_data)
 
     except Exception as e:
-        print(f"[❌ ERROR] {e}")
+        print(f"❌ Error: {e}")
+        with lock:
+            if number not in list(pending_queue.queue):
+                pending_queue.put(number)
     finally:
-        if final_url:
-            with lock:
-                completed_data[number] = {
-                    "url": final_url,
-                    "timestamp": datetime.now().isoformat()
-                }
-                save_data()
-        time.sleep(5)
         driver.quit()
+        time.sleep(3)
         with lock:
             is_running = False
             current_number = None
@@ -102,30 +94,28 @@ def start():
     number = request.args.get("number")
 
     if not number or not number.isdigit() or len(number) != 10:
-        return jsonify({"error": "Insufficient number"}), 400
+        return jsonify({"error": "Please provide a valid 10-digit mobile number."}), 400
 
     with lock:
-        # Check if already processed within expiry
-        data = completed_data.get(number)
-        if data:
-            ts = datetime.fromisoformat(data["timestamp"])
-            if datetime.now() - ts <= RESULT_EXPIRY:
-                return jsonify({"status": "Already completed", "url": data["url"]})
+        if number in results_data:
+            return jsonify({"status": "Already completed", "url": results_data[number]})
 
         if is_running:
             if number == current_number:
                 return jsonify({"status": "Processing"})
+            elif pending_queue.qsize() >= PENDING_LIMIT:
+                return jsonify({"status": "Pending list full", "pending_count": pending_queue.qsize()})
             elif number not in list(pending_queue.queue):
-                if pending_queue.qsize() < PENDING_LIMIT:
-                    pending_queue.put(number)
-                    return jsonify({"status": "Machine busy, added to queue", "pending_count": pending_queue.qsize()})
-                else:
-                    return jsonify({"status": "Pending list full", "pending_count": pending_queue.qsize()})
+                pending_queue.put(number)
+                return jsonify({
+                    "status": "Machine busy, number added to pending list",
+                    "pending_count": pending_queue.qsize()
+                })
             else:
-                return jsonify({"status": "Already in queue", "pending_count": pending_queue.qsize()})
-        else:
-            threading.Thread(target=run_browser, args=(number,)).start()
-            return jsonify({"status": "Started", "number": number})
+                return jsonify({"status": "Already in pending queue"})
+
+        threading.Thread(target=run_browser, args=(number,)).start()
+        return jsonify({"status": "Started", "number": number})
 
 @app.route("/status")
 def status():
@@ -134,17 +124,16 @@ def status():
             "status": "active" if is_running else "available",
             "current_number": current_number,
             "pending_count": pending_queue.qsize(),
-            "last_result_url": completed_data.get(current_number, {}).get("url") if current_number else None,
-            "timestamps": {k: v["timestamp"] for k, v in completed_data.items()}
+            "last_result_url": results_data.get(current_number)
         })
 
 @app.route("/results")
 def results():
-    number = request.args.get("number", "")
+    number = request.args.get("number")
     with lock:
-        data = completed_data.get(number)
-        if data:
-            return jsonify({"status": "Found", "url": data["url"]})
+        url = results_data.get(number)
+        if url:
+            return jsonify({"status": "Success", "url": url})
         return jsonify({"status": "Result not found"})
 
 @app.route("/cancel")
@@ -169,7 +158,7 @@ def change_machine():
     with lock:
         return jsonify({
             "pending_count": pending_queue.qsize(),
-            "stored_results_count": len(completed_data)
+            "total_stored_numbers": len(results_data)
         })
 
 if __name__ == "__main__":
