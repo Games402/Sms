@@ -6,37 +6,38 @@ import threading
 import time
 from queue import Queue
 from datetime import datetime, timedelta
+import re
 
 app = Flask(__name__)
 
 is_running = False
 current_number = None
 pending_queue = Queue()
-results = {}  # Store {number: (url, timestamp)}
+completed_results = {}  # Stores number: (url, timestamp)
+completion_timestamps = {}
 lock = threading.Lock()
-PENDING_LIMIT = 2
+
+# Configurable constants
+MAX_PENDING = 2
 RESULT_EXPIRY = timedelta(minutes=20)
 PENDING_EXPIRY = timedelta(minutes=6)
 
-completed_timestamps = {}  # Store {number: timestamp}
+# Helper functions
+def is_valid_number(number):
+    return re.fullmatch(r"\d{10}", number) is not None
 
-
-def cleanup_results():
+def clean_expired_data():
     now = datetime.now()
-    to_delete = [number for number, (_, ts) in results.items() if now - ts > RESULT_EXPIRY]
+    to_delete = [number for number, (_, ts) in completed_results.items() if now - ts > RESULT_EXPIRY]
     for number in to_delete:
-        del results[number]
+        completed_results.pop(number, None)
+        completion_timestamps.pop(number, None)
 
-
-def cleanup_pending():
-    now = datetime.now()
-    with lock:
-        temp_list = list(pending_queue.queue)
-        pending_queue.queue.clear()
-        for number, ts in temp_list:
-            if now - ts < PENDING_EXPIRY:
-                pending_queue.put((number, ts))
-
+    temp_queue = list(pending_queue.queue)
+    pending_queue.queue.clear()
+    for number, ts in temp_queue:
+        if now - ts <= PENDING_EXPIRY:
+            pending_queue.put((number, ts))
 
 def run_browser(number):
     global is_running, current_number
@@ -57,125 +58,123 @@ def run_browser(number):
         input_box.send_keys(number)
 
         driver.find_element(By.ID, "terms").click()
-        time.sleep(10)
+        time.sleep(5)
+
         driver.execute_script("window.scrollBy(0, 1000);")
-        time.sleep(2)
+        time.sleep(1)
         driver.execute_script("window.scrollBy(0, -500);")
-        time.sleep(2)
+        time.sleep(1)
         driver.execute_script("window.scrollBy(0, 100);")
-        time.sleep(2)
+        time.sleep(1)
 
         driver.find_element(By.ID, "submit").click()
         time.sleep(5)
+
         driver.find_element(By.ID, "verify_button").click()
+        time.sleep(1)
 
         final_url = driver.current_url
 
         with lock:
-            results[number] = (final_url, datetime.now())
-            completed_timestamps[number] = datetime.now()
+            completed_results[number] = (final_url, datetime.now())
+            completion_timestamps[number] = datetime.now()
+
+        time.sleep(5)  # Let CPU cool
 
     except Exception as e:
         print(f"❌ Error: {e}")
     finally:
         driver.quit()
-        time.sleep(5)
         with lock:
             is_running = False
             current_number = None
         process_pending()
 
-
 def process_pending():
-    cleanup_pending()
+    clean_expired_data()
     if not pending_queue.empty():
-        next_number, _ = pending_queue.get()
-        threading.Thread(target=run_browser, args=(next_number,)).start()
-
+        number, _ = pending_queue.get()
+        threading.Thread(target=run_browser, args=(number,)).start()
 
 @app.route("/start")
 def start():
     global is_running, current_number
     number = request.args.get("number")
 
-    if not number or not number.isdigit() or len(number) != 10:
-        return jsonify({"error": "Insufficient or invalid number"}), 400
+    if not number or not is_valid_number(number):
+        return jsonify({"error": "Invalid or missing 10-digit number"}), 400
 
-    cleanup_results()
+    clean_expired_data()
 
     with lock:
-        if number in results:
-            url, timestamp = results[number]
+        if number in completed_results:
+            url, timestamp = completed_results[number]
             if datetime.now() - timestamp <= RESULT_EXPIRY:
                 return jsonify({"status": "Already completed", "url": url})
             else:
-                del results[number]
+                completed_results.pop(number)
 
         if is_running:
             if number == current_number:
                 return jsonify({"status": "Processing"})
-            else:
-                queue_contents = list(pending_queue.queue)
-                if len(queue_contents) >= PENDING_LIMIT:
-                    return jsonify({"status": "Pending list full", "pending_count": len(queue_contents)})
-                if number not in [n for n, _ in queue_contents]:
-                    pending_queue.put((number, datetime.now()))
+            elif (number, _) not in list(pending_queue.queue):
+                if pending_queue.qsize() >= MAX_PENDING:
+                    return jsonify({"status": "Machine busy, pending list full"})
+                pending_queue.put((number, datetime.now()))
                 return jsonify({"status": "Machine busy, added to queue", "pending_count": pending_queue.qsize()})
 
         threading.Thread(target=run_browser, args=(number,)).start()
         return jsonify({"status": "Started", "number": number})
 
+@app.route("/results")
+def results():
+    number = request.args.get("number")
+    if not number:
+        return jsonify({"error": "Number is required"}), 400
+
+    clean_expired_data()
+
+    with lock:
+        if number in completed_results:
+            url, timestamp = completed_results[number]
+            return jsonify({"status": "Completed", "url": url})
+        else:
+            return jsonify({"status": "Result not found"})
 
 @app.route("/status")
 def status():
+    clean_expired_data()
     with lock:
-        cleanup_results()
         return jsonify({
             "is_running": is_running,
             "current_number": current_number,
             "pending_count": pending_queue.qsize(),
-            "last_result_url": results.get(current_number, (None,))[0] if current_number in results else None,
-            "completed_timestamps": {n: ts.strftime('%Y-%m-%d %H:%M:%S') for n, ts in completed_timestamps.items()}
+            "last_completed": list(completed_results.items())[-5:],
+            "completion_timestamps": {k: v.strftime("%Y-%m-%d %H:%M:%S") for k, v in completion_timestamps.items()}
         })
-
-
-@app.route("/results")
-def get_results():
-    number = request.args.get("number")
-    if not number or not number.isdigit():
-        return jsonify({"error": "Invalid number"}), 400
-
-    with lock:
-        if number in results:
-            url, timestamp = results[number]
-            return jsonify({"status": "Found", "url": url})
-        else:
-            return jsonify({"status": "Result not found"})
-
 
 @app.route("/cancel")
 def cancel():
     number = request.args.get("number")
     if not number:
-        return jsonify({"error": "number is required"}), 400
+        return jsonify({"error": "Number is required"}), 400
 
     with lock:
         q_list = list(pending_queue.queue)
-        new_list = [(n, ts) for n, ts in q_list if n != number]
+        filtered = [(n, ts) for (n, ts) in q_list if n != number]
         pending_queue.queue.clear()
-        for item in new_list:
+        for item in filtered:
             pending_queue.put(item)
         return jsonify({"status": f"{number} removed from pending queue"})
 
-
 @app.route("/change_machine")
 def change_machine():
+    clean_expired_data()
     with lock:
         return jsonify({
-            "pending_number_count": pending_queue.qsize(),
-            "total_stored_results": len(results)
+            "pending_count": pending_queue.qsize(),
+            "stored_results_count": len(completed_results)
         })
-
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
