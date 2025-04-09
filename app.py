@@ -13,31 +13,30 @@ is_running = False
 current_number = None
 pending_queue = Queue()
 latest_result = {}
-completion_timestamps = {}
+completion_times = {}
 lock = threading.Lock()
 
+LAST_PAGE_URL = None
 MAX_PENDING = 2
 RESULT_EXPIRY_MINUTES = 20
-PENDING_EXPIRY_SECONDS = 360  # 6 minutes
-
-LAST_PAGE_URL = None
-failed_numbers = set()
+PENDING_EXPIRY_MINUTES = 6
 
 
-def cleanup_old_data():
+def cleanup_old_results():
     now = datetime.now()
-    expired = [num for num, ts in completion_timestamps.items()
-               if now - ts > timedelta(minutes=RESULT_EXPIRY_MINUTES)]
-    for num in expired:
-        latest_result.pop(num, None)
-        completion_timestamps.pop(num, None)
+    to_delete = [number for number, ts in completion_times.items()
+                 if now - ts > timedelta(minutes=RESULT_EXPIRY_MINUTES)]
+    for number in to_delete:
+        del latest_result[number]
+        del completion_times[number]
 
-    # Clean old pending entries
-    if not pending_queue.empty():
-        queue_list = list(pending_queue.queue)
-        filtered = [(num, ts) for num, ts in queue_list if (now - ts).total_seconds() < PENDING_EXPIRY_SECONDS]
-        pending_queue.queue.clear()
-        for item in filtered:
+
+def cleanup_old_pending():
+    now = datetime.now()
+    items = list(pending_queue.queue)
+    pending_queue.queue.clear()
+    for item in items:
+        if now - item[1] < timedelta(minutes=PENDING_EXPIRY_MINUTES):
             pending_queue.put(item)
 
 
@@ -60,7 +59,7 @@ def run_browser(number):
         input_box.send_keys(number)
 
         driver.find_element(By.ID, "terms").click()
-        time.sleep(10)
+        time.sleep(5)
 
         driver.execute_script("window.scrollBy(0, 1000);")
         time.sleep(2)
@@ -73,16 +72,14 @@ def run_browser(number):
         time.sleep(5)
 
         driver.find_element(By.ID, "verify_button").click()
-        LAST_PAGE_URL = driver.current_url
 
+        LAST_PAGE_URL = driver.current_url
         with lock:
             latest_result[number] = LAST_PAGE_URL
-            completion_timestamps[number] = datetime.now()
+            completion_times[number] = datetime.now()
 
     except Exception as e:
         print(f"❌ Error: {e}")
-        with lock:
-            failed_numbers.add(number)
     finally:
         driver.quit()
         time.sleep(5)
@@ -93,10 +90,10 @@ def run_browser(number):
 
 
 def process_pending():
-    with lock:
-        if not pending_queue.empty():
-            next_number, _ = pending_queue.get()
-            threading.Thread(target=run_browser, args=(next_number,)).start()
+    cleanup_old_pending()
+    if not pending_queue.empty():
+        next_number, _ = pending_queue.get()
+        threading.Thread(target=run_browser, args=(next_number,)).start()
 
 
 @app.route("/start")
@@ -105,51 +102,42 @@ def start():
     number = request.args.get("number")
 
     if not number or not number.isdigit() or len(number) != 10:
-        return jsonify({"error": "Insufficient number. Provide a 10-digit number."}), 400
+        return jsonify({"error": "Insufficient number. Only 10-digit numbers allowed."}), 400
 
     with lock:
-        cleanup_old_data()
+        cleanup_old_results()
 
         if number in latest_result:
-            return jsonify({"status": "Already completed", "result_url": latest_result[number]})
+            return jsonify({"status": "Already processed", "url": latest_result[number]})
 
         if is_running:
             if number == current_number:
                 return jsonify({"status": "Processing"})
             else:
-                if number not in [num for num, _ in pending_queue.queue]:
-                    if pending_queue.qsize() >= MAX_PENDING:
-                        return jsonify({"status": "Machine busy, pending list full", "pending_count": pending_queue.qsize()}), 429
-                    pending_queue.put((number, datetime.now()))
-                return jsonify({"status": "Machine busy, added to queue", "pending_count": pending_queue.qsize()})
+                if number not in [n for n, _ in list(pending_queue.queue)]:
+                    if pending_queue.qsize() < MAX_PENDING:
+                        pending_queue.put((number, datetime.now()))
+                        return jsonify({"status": "Machine busy, added to queue", "pending_count": pending_queue.qsize()})
+                    else:
+                        return jsonify({"status": "Pending list full", "pending_count": pending_queue.qsize()}), 429
+                else:
+                    return jsonify({"status": "Already in queue", "pending_count": pending_queue.qsize()})
 
         threading.Thread(target=run_browser, args=(number,)).start()
-        return jsonify({"status": "Started", "number": number})
+        return jsonify({"status": "Started", "number": number, "pending_count": pending_queue.qsize()})
 
 
 @app.route("/status")
 def status():
     with lock:
-        cleanup_old_data()
+        cleanup_old_results()
         return jsonify({
-            "is_running": is_running,
+            "machine_status": "Active" if is_running else "Available",
             "current_number": current_number,
             "pending_count": pending_queue.qsize(),
-            "last_result_url": LAST_PAGE_URL,
-            "completed_timestamps": {k: v.strftime("%Y-%m-%d %H:%M:%S") for k, v in completion_timestamps.items()}
+            "completed": list(completion_times.items())[-5:],
+            "last_result_url": LAST_PAGE_URL
         })
-
-
-@app.route("/results")
-def results():
-    number = request.args.get("number")
-    if not number:
-        return jsonify({"error": "number is required"}), 400
-    with lock:
-        if number in latest_result:
-            return jsonify({"number": number, "url": latest_result[number]})
-        else:
-            return jsonify({"status": "No result found for this number"})
 
 
 @app.route("/cancel")
@@ -160,29 +148,31 @@ def cancel():
 
     with lock:
         q_list = list(pending_queue.queue)
-        for i in range(len(q_list)):
-            if q_list[i][0] == number:
-                q_list.pop(i)
-                break
+        new_q = [(n, ts) for n, ts in q_list if n != number]
         pending_queue.queue.clear()
-        for item in q_list:
+        for item in new_q:
             pending_queue.put(item)
         return jsonify({"status": f"{number} removed from pending queue"})
 
 
-@app.route("/clear")
-def clear():
+@app.route("/results")
+def results():
+    number = request.args.get("number")
+    if not number:
+        return jsonify({"error": "number is required"}), 400
     with lock:
-        pending_queue.queue.clear()
-        return jsonify({"status": "All pending numbers cleared"})
+        if number in latest_result:
+            return jsonify({"url": latest_result[number]})
+        else:
+            return jsonify({"status": "No result found for this number"})
 
 
 @app.route("/change_machine")
 def change_machine():
     with lock:
         return jsonify({
-            "pending_numbers": [num for num, _ in pending_queue.queue],
-            "completed_count": len(latest_result)
+            "pending_count": pending_queue.qsize(),
+            "stored_results": len(latest_result)
         })
 
 
