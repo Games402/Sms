@@ -2,47 +2,60 @@ from flask import Flask, request, jsonify
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
-import threading
+from threading import Lock, Thread
+from queue import Queue
 import time
 import json
 import os
-from queue import Queue
-from datetime import datetime, timedelta
 
 app = Flask(__name__)
 
-DATA_FILE = "results.json"
+# Constants
+RESULT_FILE = "results.json"
+LOG_FILE = "logs.json"
 MAX_PENDING = 2
-WAIT_1 = 45  # seconds
-WAIT_2 = 35  # seconds
+WAIT_BEFORE_SUBMIT = 35
+WAIT_BEFORE_VERIFY = 45
 
+# Shared state
+lock = Lock()
 is_running = False
 current_number = None
 pending_queue = Queue()
-lock = threading.Lock()
+results = {}
+logs = {}
 
-# Load stored results
-if os.path.exists(DATA_FILE):
-    with open(DATA_FILE, "r") as f:
-        result_data = json.load(f)
-else:
-    result_data = {}
+# Load stored data
+def load_data():
+    global results, logs
+    if os.path.exists(RESULT_FILE):
+        with open(RESULT_FILE, "r") as f:
+            results = json.load(f)
+    if os.path.exists(LOG_FILE):
+        with open(LOG_FILE, "r") as f:
+            logs = json.load(f)
 
-def save_results():
-    with open(DATA_FILE, "w") as f:
-        json.dump(result_data, f, indent=2)
+# Save result
+def save_result(number, url):
+    global results
+    results[number] = url
+    with open(RESULT_FILE, "w") as f:
+        json.dump(results, f, indent=2)
 
-def is_valid_number(number):
-    return number.isdigit() and len(number) == 10
+# Save logs
+def add_log(number, message):
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    logs.setdefault(number, []).append(f"[{timestamp}] {message}")
+    with open(LOG_FILE, "w") as f:
+        json.dump(logs, f, indent=2)
 
+# Main automation
 def run_browser(number):
     global is_running, current_number
-
     with lock:
         is_running = True
         current_number = number
-
-    url = None
+    add_log(number, "Started processing")
 
     options = Options()
     options.add_argument("--headless=new")
@@ -53,124 +66,106 @@ def run_browser(number):
         driver = webdriver.Chrome(options=options)
         driver.get("https://www.thecallbomber.in")
 
-        driver.find_element(By.TAG_NAME, "input").send_keys(number)
+        input_box = driver.find_element(By.TAG_NAME, "input")
+        input_box.send_keys(number)
         driver.find_element(By.ID, "terms").click()
 
-        time.sleep(WAIT_1)
-
+        time.sleep(WAIT_BEFORE_SUBMIT)
         driver.execute_script("window.scrollBy(0, 1000);")
-        time.sleep(3)
+        time.sleep(5)
         driver.execute_script("window.scrollBy(0, -500);")
-        time.sleep(2)
+        time.sleep(5)
         driver.execute_script("window.scrollBy(0, 100);")
-        time.sleep(2)
+        time.sleep(5)
 
         driver.find_element(By.ID, "submit").click()
-        time.sleep(WAIT_2)
+        time.sleep(WAIT_BEFORE_VERIFY)
 
         driver.find_element(By.ID, "verify_button").click()
         time.sleep(5)
 
-        url = driver.current_url
-        print(f"✅ Completed for {number} with URL: {url}")
-
-        with lock:
-            result_data[number] = url
-            save_results()
+        final_url = driver.current_url
+        save_result(number, final_url)
+        add_log(number, f"Successfully stored URL: {final_url}")
 
     except Exception as e:
-        print(f"❌ Error for {number}: {e}")
-        with lock:
-            if number not in list(pending_queue.queue):
-                if pending_queue.qsize() < MAX_PENDING:
-                    pending_queue.put(number)
+        add_log(number, f"Error: {str(e)}")
     finally:
-        try:
-            driver.quit()
-        except:
-            pass
-        time.sleep(5)
+        driver.quit()
+        time.sleep(5)  # Cooldown
         with lock:
             is_running = False
             current_number = None
         process_pending()
 
+# Process pending queue
 def process_pending():
-    with lock:
-        if not pending_queue.empty():
-            next_number = pending_queue.get()
-            threading.Thread(target=run_browser, args=(next_number,)).start()
+    if not pending_queue.empty():
+        next_number = pending_queue.get()
+        add_log(next_number, "Picked from queue")
+        Thread(target=run_browser, args=(next_number,)).start()
 
+# API: /start?number=
 @app.route("/start")
 def start():
     global is_running, current_number
 
-    number = request.args.get("number", "")
-    if not is_valid_number(number):
-        return jsonify({"error": "Invalid or insufficient number"}), 400
+    number = request.args.get("number", "").strip()
+    if not number.isdigit() or len(number) != 10:
+        return jsonify({"error": "Only 10-digit number allowed"}), 400
+
+    if number in results:
+        add_log(number, "Already completed - result returned")
+        return jsonify({"status": "Already completed", "url": results[number]})
 
     with lock:
-        if number in result_data:
-            return jsonify({"status": "Already completed", "url": result_data[number]})
-
         if is_running:
             if number == current_number:
-                return jsonify({"status": "Processing"})
+                return jsonify({"status": "Already in progress"})
             elif number not in list(pending_queue.queue):
-                if pending_queue.qsize() < MAX_PENDING:
-                    pending_queue.put(number)
-                    return jsonify({"status": "Machine busy, added to pending list", "pending_count": pending_queue.qsize()})
-                else:
-                    return jsonify({"status": "Pending list full", "pending_count": pending_queue.qsize()})
+                if pending_queue.qsize() >= MAX_PENDING:
+                    return jsonify({"status": "Pending queue full"})
+                pending_queue.put(number)
+                add_log(number, "Added to pending queue")
+                return jsonify({
+                    "status": "Machine busy, added to pending list",
+                    "pending_count": pending_queue.qsize()
+                })
             else:
-                return jsonify({"status": "Already in pending list", "pending_count": pending_queue.qsize()})
-        else:
-            threading.Thread(target=run_browser, args=(number,)).start()
-            return jsonify({"status": "Started", "number": number})
+                return jsonify({"status": "Already in queue"})
 
+        Thread(target=run_browser, args=(number,)).start()
+        return jsonify({"status": "Started", "number": number})
+
+# API: /results?number=
 @app.route("/results")
-def results():
+def get_result():
     number = request.args.get("number", "")
-    with lock:
-        url = result_data.get(number)
-        if url:
-            return jsonify({"status": "Completed", "url": url})
-        return jsonify({"status": "Result not found"})
+    url = results.get(number)
+    if url:
+        return jsonify({"status": "success", "url": url})
+    return jsonify({"status": "Result not found"})
 
-@app.route("/cancel")
-def cancel():
-    number = request.args.get("number")
-    if not number:
-        return jsonify({"error": "number is required"}), 400
-
-    with lock:
-        q_list = list(pending_queue.queue)
-        if number in q_list:
-            q_list.remove(number)
-            pending_queue.queue.clear()
-            for item in q_list:
-                pending_queue.put(item)
-            return jsonify({"status": f"{number} removed from pending queue"})
-        else:
-            return jsonify({"status": f"{number} not in pending queue"})
-
-@app.route("/status")
-def status():
+# API: /all_info
+@app.route("/all_info")
+def all_info():
     with lock:
         return jsonify({
             "status": "active" if is_running else "available",
             "current_number": current_number,
             "pending_count": pending_queue.qsize(),
-            "last_result_url": result_data.get(current_number)
+            "pending_numbers": list(pending_queue.queue),
+            "stored_numbers": list(results.keys())
         })
 
-@app.route("/change_machine")
-def change_machine():
-    with lock:
-        return jsonify({
-            "pending_number_count": pending_queue.qsize(),
-            "total_stored": len(result_data)
-        })
+# API: /log?number=
+@app.route("/log")
+def get_log():
+    number = request.args.get("number", "")
+    return jsonify({"logs": logs.get(number, [])})
+
+# Load previous session data on startup
+load_data()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
